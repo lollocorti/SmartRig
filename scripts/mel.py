@@ -123,7 +123,14 @@ class GuitarDataset(Dataset):
     def __getitem__(self, idx):
         item = self.metadata[idx]
 
-        spec_path = os.path.join(self.dataset_dir, item["mel_file"])
+        # Converte 'mel\sample.npy' in 'mel/sample.npy' su Linux/Colab
+        rel_mel_path = os.path.normpath(item["mel_file"])
+        spec_path = os.path.join(self.dataset_dir, rel_mel_path)
+
+        # Fallback di sicurezza nel caso i file siano estratti sfusi nella root
+        if not os.path.exists(spec_path):
+            spec_path = os.path.join(self.dataset_dir, os.path.basename(rel_mel_path))
+
         mel_norm = np.load(spec_path)
         x_tensor = torch.tensor(mel_norm, dtype=torch.float32).unsqueeze(0)
 

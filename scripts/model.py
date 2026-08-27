@@ -24,26 +24,93 @@ class ResBlock(nn.Module):
         out += residual
         return self.relu(out)
 
-
-class GuitarEffectsNet(nn.Module):
-    def __init__(self, num_amp_classes=10):
+class CNNBackbone(nn.Module):
+    """Estrazione feature 2D scalabile dagli spettrogrammi Mel"""
+    def __init__(self, out_channels=512):
         super().__init__()
-
-        # Extractor Feature Convolutional (ResNet Backbone)
+        c1, c2, c3 = out_channels // 8, out_channels // 4, out_channels // 2
+        
         self.stem = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(1, c1, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(c1),
             nn.ReLU(inplace=True)
         )
-        self.layer1 = ResBlock(32, 64, stride=2)
-        self.layer2 = ResBlock(64, 128, stride=2)
-        self.layer3 = ResBlock(128, 256, stride=2)
-        self.layer4 = ResBlock(256, 512, stride=2)
+        self.layer1 = ResBlock(c1, c2, stride=2)
+        self.layer2 = ResBlock(c2, c3, stride=2)
+        self.layer3 = ResBlock(c3, out_channels, stride=2)
 
-        # Pooling solo sulla dimensione delle frequenze (F -> 1), preservando il tempo (T)
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.layer1(x)
+        x = self.layer2(x)
+        return self.layer3(x)  # Shape: [B, out_channels, F', T']
+
+class AmpNet(nn.Module):
+    def __init__(self, num_classes=10):
+        super().__init__()
+        self.backbone = CNNBackbone(out_channels=512)
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.4),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        feat = self.backbone(x)
+        feat = self.global_pool(feat).flatten(1)
+        return self.classifier(feat)
+
+class DriveNet(nn.Module):
+    def __init__(self, num_types=3, num_models=10):
+        super().__init__()
+        self.backbone = CNNBackbone(out_channels=512)
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+        
+        self.shared_fc = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.BatchNorm1d(256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.3)
+        )
+        self.head_type = nn.Linear(256, num_types)
+        self.head_model = nn.Linear(256, num_models)
+
+    def forward(self, x):
+        feat = self.backbone(x)
+        feat = self.global_pool(feat).flatten(1)
+        feat = self.shared_fc(feat)
+        return self.head_type(feat), self.head_model(feat)
+
+class CabinetNet(nn.Module):
+    def __init__(self, num_cabs=9):
+        super().__init__()
+        self.backbone = CNNBackbone(out_channels=256)
+        self.time_pool = nn.AdaptiveAvgPool2d((None, 1))
+        self.freq_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        self.classifier = nn.Sequential(
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=0.2),
+            nn.Linear(128, num_cabs)
+        )
+
+    def forward(self, x):
+        feat = self.backbone(x)
+        feat = self.time_pool(feat)
+        feat = self.freq_pool(feat).flatten(1)
+        return self.classifier(feat)
+
+class ChorusNet(nn.Module):
+    def __init__(self, num_params=5):
+        super().__init__()
+        self.backbone = CNNBackbone(out_channels=512)
         self.freq_pool = nn.AdaptiveAvgPool2d((1, None))
 
-        # Modulo Ricorrente (BiGRU) per analizzare l'evoluzione temporale dell'audio
         self.gru = nn.GRU(
             input_size=512,
             hidden_size=256,
@@ -52,61 +119,51 @@ class GuitarEffectsNet(nn.Module):
             bidirectional=True
         )
 
-        # Attention Mechanism per pesare i frame temporali rilevanti (es. attacco della nota)
         self.attention = nn.Sequential(
             nn.Linear(512, 128),
             nn.Tanh(),
             nn.Linear(128, 1)
         )
 
-        # FC Condivisa con Dropout incrementato per evitare overfitting
-        self.shared_fc = nn.Sequential(
-            nn.Linear(512, 256),  # 256 * 2 (dovuto a bidirectional GRU)
-            nn.BatchNorm1d(256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(p=0.4)
-        )
-
-        # Head 1: Classificazione Amplificatore
-        self.head_amp = nn.Linear(256, num_amp_classes)
-
-        # Head 2: Classificazione Pedali ON/OFF (Logits)
-        self.head_onoff = nn.Linear(256, 5)
-
-        # Head 3: Regressione Parametri Manopole [0, 1]
+        self.head_active = nn.Linear(256, 1)
         self.head_params = nn.Sequential(
             nn.Linear(256, 128),
             nn.ReLU(inplace=True),
-            nn.Dropout(p=0.3),
-            nn.Linear(128, 15),
+            nn.Linear(128, num_params),
             nn.Sigmoid()
         )
 
     def forward(self, x):
-        # 1. Extractor Convoluzionale
-        x = self.stem(x)
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)  # Shape: [B, 512, F, T]
+        feat = self.backbone(x)
+        feat = self.freq_pool(feat).squeeze(2)
+        feat = feat.permute(0, 2, 1)
 
-        # 2. Pooling Frequenziale
-        x = self.freq_pool(x).squeeze(2)  # Shape: [B, 512, T]
-        x = x.permute(0, 2, 1)            # Shape: [B, T, 512] (compatibile con GRU)
+        gru_out, _ = self.gru(feat)
+        attn_weights = torch.softmax(self.attention(gru_out), dim=1)
+        context = torch.sum(gru_out * attn_weights, dim=1)
 
-        # 3. Processamento Ricorrente Temporal-Aware
-        gru_out, _ = self.gru(x)          # Shape: [B, T, 512]
+        dense = torch.relu(context[:, :256] + context[:, 256:])
+        
+        is_active = self.head_active(dense)
+        params = self.head_params(dense)
+        
+        return is_active, params
 
-        # 4. Temporal Attention Pooling (Sostituisce torch.mean)
-        attn_weights = torch.softmax(self.attention(gru_out), dim=1)  # Shape: [B, T, 1]
-        feat_temporal = torch.sum(gru_out * attn_weights, dim=1)      # Shape: [B, 512]
+class HighpassNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.backbone = CNNBackbone(out_channels=128)
+        self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
 
-        # 5. Dense Layer condiviso
-        feat = self.shared_fc(feat_temporal)
+        self.head_active = nn.Linear(128, 1)
+        self.head_cutoff = nn.Sequential(
+            nn.Linear(128, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1)
+        )
 
-        # 6. Output Heads
-        logits_amp = self.head_amp(feat)
-        logits_onoff = self.head_onoff(feat)
-        pred_params = self.head_params(feat)
-
-        return logits_amp, logits_onoff, pred_params
+    def forward(self, x):
+        feat = self.global_pool(self.backbone(x)).flatten(1)
+        active_logits = self.head_active(feat)
+        cutoff_val = self.head_cutoff(feat)
+        return active_logits, cutoff_val

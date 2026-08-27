@@ -1,7 +1,7 @@
 import os
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, random_split
 from mel import GuitarDataset
 import matplotlib.pyplot as plt
 
@@ -15,10 +15,6 @@ from model import (
 )
 
 def get_next_model_path(models_dir, model_prefix):
-    """
-    Genera percorsi dinamici per salvare checkpoints e grafici di loss 
-    basati sul nome del modulo (es. amp_model1.pth).
-    """
     os.makedirs(models_dir, exist_ok=True)
     existing_indices = []
     
@@ -102,7 +98,12 @@ def train_single_module(model, model_name, train_loader, val_loader, compute_los
                 print(f"[Early Stopping] Training interrotto per {model_name}.")
                 break
 
-    #Grafico della loss
+    # Ricarica i migliori pesi salvati prima di uscire
+    if os.path.exists(save_path):
+        checkpoint = torch.load(save_path)
+        model.load_state_dict(checkpoint['model_state_dict'])
+
+    # Grafico della loss
     plt.figure(figsize=(8, 4))
     plt.plot(train_losses, label='Train Loss')
     plt.plot(val_losses, label='Val Loss')
@@ -133,21 +134,21 @@ def train_pipeline(target_module="all", dataset_dir=None, models_dir=None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Dispositivo attivo: {device}")
 
-    # Caricamento del dataset
-    train_dataset_full = GuitarDataset(dataset_dir=dataset_dir, is_train=True)
-    val_dataset_full = GuitarDataset(dataset_dir=dataset_dir, is_train=False)
-
-    total_samples = len(train_dataset_full)
+    # Caricamento unificato del dataset ed estrazione split deterministico
+    full_dataset = GuitarDataset(dataset_dir=dataset_dir)
+    total_samples = len(full_dataset)
     train_size = int(0.85 * total_samples)
+    val_size = total_samples - train_size
 
-    generator = torch.Generator().manual_seed(42)
-    indices = torch.randperm(total_samples, generator=generator).tolist()
+    train_subset, val_subset = random_split(
+        full_dataset, 
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
+    )
 
-    train_subset = Subset(train_dataset_full, indices[:train_size])
-    val_subset = Subset(val_dataset_full, indices[train_size:])
-
-    train_loader = DataLoader(train_subset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_subset, batch_size=32, shuffle=False)
+    num_workers = 2 if is_colab else 0
+    train_loader = DataLoader(train_subset, batch_size=32, shuffle=True, num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(val_subset, batch_size=32, shuffle=False, num_workers=num_workers, pin_memory=True)
 
     # Criteria di loss
     criterion_ce = nn.CrossEntropyLoss(label_smoothing=0.1)
@@ -164,7 +165,6 @@ def train_pipeline(target_module="all", dataset_dir=None, models_dir=None):
         return criterion_ce(logits, y_amp)
 
     def loss_drive(model, batch, device):
-        # Presuppone che y_params contenga l'indice di tipo overdrive [0] e modello [1]
         x, _, _, y_params = batch
         x = prepare_input(x, device)
         y_params = y_params.to(device)
@@ -175,7 +175,6 @@ def train_pipeline(target_module="all", dataset_dir=None, models_dir=None):
         return criterion_ce(pred_type, y_drive_type) + criterion_ce(pred_model, y_drive_model)
 
     def loss_cabinet(model, batch, device):
-        # Presuppone che il target IR cabinet risieda all'interno di y_params (es. indice 7)
         x, _, _, y_params = batch
         x = prepare_input(x, device)
         y_cab = y_params[:, 7].long() if y_params.size(1) > 7 else y_params[:, -1].long()
@@ -195,14 +194,13 @@ def train_pipeline(target_module="all", dataset_dir=None, models_dir=None):
         pred_active, pred_params = model(x)
         l_active = criterion_bce(pred_active, target_active)
         
-        # Mascheramento corretto calcolato solo sulle istanze con effetto attivo
-        mask = target_active.repeat(1, pred_params.size(1))
+        mask = target_active.expand_as(pred_params)
         active_elements = mask.sum()
         
         if active_elements > 0:
             l_params = torch.sum(((pred_params - target_chorus_params) ** 2) * mask) / active_elements
         else:
-            l_params = 0.0
+            l_params = (pred_params * 0.0).sum()
             
         return l_active + 1.0 * l_params
 
@@ -224,12 +222,12 @@ def train_pipeline(target_module="all", dataset_dir=None, models_dir=None):
 
     # Mappatura e istanziazione modelli
     amp_meta = {
-        'amp_to_id': getattr(train_dataset_full, 'amp_to_id', {}),
-        'id_to_amp': getattr(train_dataset_full, 'id_to_amp', {})
+        'amp_to_id': getattr(full_dataset, 'amp_to_id', {}),
+        'id_to_amp': getattr(full_dataset, 'id_to_amp', {})
     }
 
     modules_to_train = {
-        "amp": (AmpNet(num_classes=len(train_dataset_full.amp_to_id)), loss_amp, amp_meta),
+        "amp": (AmpNet(num_classes=len(full_dataset.amp_to_id)), loss_amp, amp_meta),
         "drive": (DriveNet(num_types=3, num_models=10), loss_drive, None),
         "cabinet": (CabinetNet(num_cabs=9), loss_cabinet, None),
         "chorus": (ChorusNet(num_params=5), loss_chorus, None),

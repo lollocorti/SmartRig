@@ -4,6 +4,9 @@ IDMT-SMT-GUITAR_V2/
 env/
 ir/
 amp_heads/
+vecchio/
+presets/
+idmt_48k_cache/
 
 # Modelli, pesi ed esecuzioni temporanee
 *.pth

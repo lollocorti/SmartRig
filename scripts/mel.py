@@ -7,53 +7,21 @@ import soundfile as sf
 from torch.utils.data import Dataset
 import torchaudio.transforms as T
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-DATASET_DIR = os.path.join(PROJECT_ROOT, "dataset")
 
-PARAM_RANGES = {
-    "highpass_cutoff": (80.0, 350.0),
-    "distortion_drive": (6.0, 30.0),
-    "chorus_rate": (0.5, 2.2),
-    "chorus_depth": (0.15, 0.50),
-    "chorus_delay": (7.0, 20.0),
-    "chorus_feedback": (0.10, 0.40),
-    "chorus_mix": (0.20, 0.50),
-    "delay_time": (0.18, 0.55),
-    "delay_feedback": (0.15, 0.45),
-    "delay_mix": (0.15, 0.45),
-    "reverb_room": (0.2, 0.8),
-    "reverb_damping": (0.2, 0.7),
-    "reverb_wet": (0.15, 0.50),
-    "reverb_dry": (0.8, 1.0),
-    "reverb_width": (0.5, 1.0)
-}
-
-def normalize_val(val, min_v, max_v):
-    """Normalizza un valore continuo nel range [0, 1]. Gestisce None e divisioni per zero."""
-    if val is None:
-        return 0.0
-    if max_v == min_v:
-        return 0.0
-    return float(np.clip((val - min_v) / (max_v - min_v), 0.0, 1.0))
-
-def compute_mel_feature(audio, sr=48000, n_mels=128, n_fft=2048, hop_length=512):
-    """Funzione di estrazione Mel unica per training e inferenza."""
+def compute_mel_feature(audio: np.ndarray, sr: int = 48000, n_mels: int = 256) -> np.ndarray:
     if audio.ndim > 1:
         audio = np.mean(audio, axis=1)
     
     mel_spec = librosa.feature.melspectrogram(
-        y=audio, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels
+        y=audio, sr=sr, n_fft=2048, hop_length=512, n_mels=n_mels
     )
     
-    # Usa ref=1.0 per preservare l'ampiezza e la dinamica reale introdotta da pedali ed amp
     mel_db = librosa.power_to_db(mel_spec, ref=1.0)
-    
-    # Normalizzazione lineare in range [0, 1] considerando dinamica audio tra -80dB e 0dB
     mel_norm = np.clip((mel_db + 80.0) / 80.0, 0.0, 1.0)
     return mel_norm.astype(np.float32)
 
-def generate_mel_spectrograms(dataset_dir=DATASET_DIR):
+
+def generate_mel_spectrograms(dataset_dir: str, sample_rate: int = 48000, n_mels: int = 256):
     json_path = os.path.join(dataset_dir, "dataset_labels.json")
     if not os.path.exists(json_path):
         raise FileNotFoundError(f"File di metadati non trovato: {json_path}")
@@ -64,7 +32,7 @@ def generate_mel_spectrograms(dataset_dir=DATASET_DIR):
     with open(json_path, "r", encoding="utf-8") as f:
         metadata = json.load(f)
 
-    print(f"--- Calcolo Spettrogrammi Mel ({len(metadata)} campioni) ---")
+    print(f"[MEL] Calcolo spettrogrammi ({n_mels} mels, N={len(metadata)})...")
     for idx, item in enumerate(metadata):
         audio_rel_path = item.get("audio_file")
         if not audio_rel_path:
@@ -78,22 +46,20 @@ def generate_mel_spectrograms(dataset_dir=DATASET_DIR):
         mel_abs_path = os.path.join(mel_dir, base_filename)
 
         audio, sr = sf.read(audio_abs_path)
-        mel_norm = compute_mel_feature(audio, sr=sr)
+        mel_norm = compute_mel_feature(audio, sr=sr, n_mels=n_mels)
         np.save(mel_abs_path, mel_norm)
 
-        # Salvataggio del percorso relativo verso la cartella mel/
         item["mel_file"] = os.path.join("mel", base_filename)
 
         if (idx + 1) % 500 == 0 or (idx + 1) == len(metadata):
-            print(f"Progresso Mel: {idx + 1}/{len(metadata)} spettrogrammi calcolati.")
+            print(f"[MEL] Processati {idx + 1}/{len(metadata)}")
 
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, indent=4)
-    print("Spettrogrammi generati e metadati aggiornati con successo!\n")
 
 
 class GuitarDataset(Dataset):
-    def __init__(self, dataset_dir=DATASET_DIR, is_train=True):
+    def __init__(self, dataset_dir: str, is_train: bool = True):
         self.dataset_dir = dataset_dir
         self.is_train = is_train
         json_path = os.path.join(self.dataset_dir, "dataset_labels.json")
@@ -104,32 +70,56 @@ class GuitarDataset(Dataset):
         with open(json_path, "r", encoding="utf-8") as f:
             self.metadata = json.load(f)
 
-        amps = set()
-        for item in self.metadata:
-            amp = item.get("amplifier")
-            amp_name = f"{amp['brand']}_{amp['model']}" if amp else "UNKNOWN"
-            amps.add(amp_name)
-        
-        self.amp_to_id = {amp_name: idx for idx, amp_name in enumerate(sorted(amps))}
-        self.id_to_amp = {idx: amp_name for amp_name, idx in self.amp_to_id.items()}
-
-        # SpecAugment applicato esclusivamente durante la fase di training
         self.time_masking = T.TimeMasking(time_mask_param=35)
-        self.freq_masking = T.FrequencyMasking(freq_mask_param=20)
+        self.freq_masking = T.FrequencyMasking(freq_mask_param=30)
+
+        # 1. Costruzione dei vocabolari dei modelli e della configurazione globale
+        self.chain_config, self.model2id = self._build_chain_vocab()
+
+    def _build_chain_vocab(self):
+        """Analizza il dataset per mappare tutti i blocchi, modelli e max parametri."""
+        blocks_info = {}
+
+        for item in self.metadata:
+            chain = item.get("signal_chain", {})
+            if "config" in chain and "blocks" in chain["config"]:
+                blocks = chain["config"]["blocks"]
+                for b_id, b_data in blocks.items():
+                    if b_id not in blocks_info:
+                        blocks_info[b_id] = {"models": set(), "max_params": 0}
+
+                    model_name = b_data.get("model", "Unknown")
+                    blocks_info[b_id]["models"].add(model_name)
+
+                    num_params = len(b_data.get("parameters", {}))
+                    if num_params > blocks_info[b_id]["max_params"]:
+                        blocks_info[b_id]["max_params"] = num_params
+
+        chain_config = []
+        model2id = {}
+
+        for b_id, info in sorted(blocks_info.items()):
+            models_list = sorted(list(info["models"]))
+            model2id[b_id] = {m_name: idx for idx, m_name in enumerate(models_list)}
+
+            chain_config.append({
+                "block_id": b_id,
+                "num_models": max(len(models_list), 1),
+                "max_params": max(info["max_params"], 1)
+            })
+
+        return chain_config, model2id
+
+    def get_chain_config(self):
+        return self.chain_config
 
     def __len__(self):
         return len(self.metadata)
 
     def __getitem__(self, idx):
         item = self.metadata[idx]
-
-        # Converte 'mel\sample.npy' in 'mel/sample.npy' su Linux/Colab
         rel_mel_path = os.path.normpath(item["mel_file"])
         spec_path = os.path.join(self.dataset_dir, rel_mel_path)
-
-        # Fallback di sicurezza nel caso i file siano estratti sfusi nella root
-        if not os.path.exists(spec_path):
-            spec_path = os.path.join(self.dataset_dir, os.path.basename(rel_mel_path))
 
         mel_norm = np.load(spec_path)
         x_tensor = torch.tensor(mel_norm, dtype=torch.float32).unsqueeze(0)
@@ -138,47 +128,49 @@ class GuitarDataset(Dataset):
             x_tensor = self.freq_masking(x_tensor)
             x_tensor = self.time_masking(x_tensor)
 
-        amp = item.get("amplifier")
-        amp_name = f"{amp['brand']}_{amp['model']}" if amp else "UNKNOWN"
-        amp_target = torch.tensor(self.amp_to_id[amp_name], dtype=torch.long)
+        chain = item.get("signal_chain", {})
+        targets = {}
 
-        fx = item.get("signal_chain", {})
-        
-        hp = fx.get("highpass", {})
-        dist = fx.get("drive", {})
-        ch = fx.get("chorus", {})
-        dl = fx.get("delay", {})
-        rv = fx.get("reverb", {})
+        # 2. Estrazione omogenea dei target per ciascun blocco della catena globale
+        if "config" in chain and "blocks" in chain["config"]:
+            sample_blocks = chain["config"]["blocks"]
 
-        onoff_targets = [
-            float(hp.get("enabled", False)),
-            float(dist.get("enabled", False)),
-            float(ch.get("enabled", False)),
-            float(dl.get("enabled", False)),
-            float(rv.get("enabled", False))
-        ]
+            for cfg in self.chain_config:
+                b_id = cfg["block_id"]
+                max_params = cfg["max_params"]
 
-        params_normalized = [
-            normalize_val(hp.get("cutoff_frequency_hz"), *PARAM_RANGES["highpass_cutoff"]),
-            normalize_val(dist.get("drive_db"), *PARAM_RANGES["distortion_drive"]),
-            normalize_val(ch.get("rate_hz"), *PARAM_RANGES["chorus_rate"]),
-            normalize_val(ch.get("depth"), *PARAM_RANGES["chorus_depth"]),
-            normalize_val(ch.get("centre_delay_ms"), *PARAM_RANGES["chorus_delay"]),
-            normalize_val(ch.get("feedback"), *PARAM_RANGES["chorus_feedback"]),
-            normalize_val(ch.get("mix"), *PARAM_RANGES["chorus_mix"]),
-            normalize_val(dl.get("delay_seconds"), *PARAM_RANGES["delay_time"]),
-            normalize_val(dl.get("feedback"), *PARAM_RANGES["delay_feedback"]),
-            normalize_val(dl.get("mix"), *PARAM_RANGES["delay_mix"]),
-            normalize_val(rv.get("room_size"), *PARAM_RANGES["reverb_room"]),
-            normalize_val(rv.get("damping"), *PARAM_RANGES["reverb_damping"]),
-            normalize_val(rv.get("wet_level"), *PARAM_RANGES["reverb_wet"]),
-            normalize_val(rv.get("dry_level"), *PARAM_RANGES["reverb_dry"]),
-            normalize_val(rv.get("width"), *PARAM_RANGES["reverb_width"])
-        ]
+                if b_id in sample_blocks:
+                    b_data = sample_blocks[b_id]
+                    is_active = 1.0 if b_data.get("enabled", False) else 0.0
 
-        return (
-            x_tensor, 
-            amp_target, 
-            torch.tensor(onoff_targets, dtype=torch.float32), 
-            torch.tensor(params_normalized, dtype=torch.float32)
-        )
+                    m_name = b_data.get("model", "Unknown")
+                    model_idx = self.model2id[b_id].get(m_name, 0)
+
+                    # Estrazione e padding dei parametri continui/numerici
+                    raw_params = list(b_data.get("parameters", {}).values())
+                    num_params = [p for p in raw_params if isinstance(p, (int, float)) and not isinstance(p, bool)]
+                    
+                    # Padding fino a max_params
+                    padded_params = num_params[:max_params] + [0.0] * max(0, max_params - len(num_params))
+                else:
+                    # Blocco non presente nel singolo preset -> target neutri/disattivati
+                    is_active = 0.0
+                    model_idx = 0
+                    padded_params = [0.0] * max_params
+
+                targets[b_id] = {
+                    "active": torch.tensor(is_active, dtype=torch.float32),
+                    "model": torch.tensor(model_idx, dtype=torch.long),
+                    "params": torch.tensor(padded_params, dtype=torch.float32)
+                }
+        else:
+            # Fallback se le label sono in formato differente
+            for cfg in self.chain_config:
+                b_id = cfg["block_id"]
+                targets[b_id] = {
+                    "active": torch.tensor(0.0, dtype=torch.float32),
+                    "model": torch.tensor(0, dtype=torch.long),
+                    "params": torch.tensor([0.0] * cfg["max_params"], dtype=torch.float32)
+                }
+
+        return x_tensor, targets

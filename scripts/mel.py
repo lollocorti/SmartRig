@@ -118,8 +118,14 @@ class GuitarDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.metadata[idx]
-        rel_mel_path = os.path.normpath(item["mel_file"])
-        spec_path = os.path.join(self.dataset_dir, rel_mel_path)
+        # Nel metodo __getitem__ di mel.py
+        rel_path = self.samples[idx]["mel_file"]
+
+        # Sostituisce le barre rovesciate di Windows con quelle standard di Linux/POSIX
+        rel_path_clean = rel_path.replace("\\", "/")
+
+        # Costruisce il percorso in modo portabile su qualsiasi sistema operativo
+        spec_path = os.path.normpath(os.path.join(self.dataset_dir, rel_path_clean))
 
         mel_norm = np.load(spec_path)
         x_tensor = torch.tensor(mel_norm, dtype=torch.float32).unsqueeze(0)

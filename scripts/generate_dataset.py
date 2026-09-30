@@ -133,15 +133,27 @@ def generate_dataset_optimized(num_samples: int = NUM_SAMPLES, dataset_dir: str 
         try:
             with open(json_path, "r", encoding="utf-8") as f:
                 metadata = json.load(f)
-                
+
             valid_metadata = []
             for item in metadata:
-                rel_audio_path = item.get("audio_file", "")
-                rel_mel_path = item.get("mel_file", "")
-                abs_audio_path = os.path.join(dataset_dir, rel_audio_path)
-                abs_mel_path = os.path.join(dataset_dir, rel_mel_path) if rel_mel_path else ""
-                
-                if os.path.exists(abs_audio_path) and os.path.exists(abs_mel_path):
+                # 1. Normalizzazione stringhe percorso: converte le barre Windows (\) in formato POSIX (/)
+                rel_audio_path = item.get("audio_file", "").replace("\\", "/")
+                rel_mel_path = item.get("mel_file", "").replace("\\", "/")
+
+                # Aggiorna le chiavi dell'item così i percorsi salvati nel JSON saranno puliti e senza '\\'
+                item["audio_file"] = rel_audio_path
+                if "mel_file" in item:
+                    item["mel_file"] = rel_mel_path
+
+                # 2. Costruzione percorsi assoluti portabili cross-platform
+                abs_audio_path = os.path.normpath(os.path.join(dataset_dir, rel_audio_path))
+                abs_mel_path = os.path.normpath(os.path.join(dataset_dir, rel_mel_path)) if rel_mel_path else ""
+
+                # 3. Controllo di esistenza flessibile (se mel non è richiesto/presente, controlla solo l'audio)
+                audio_exists = os.path.exists(abs_audio_path)
+                mel_exists = os.path.exists(abs_mel_path) if abs_mel_path else True
+
+                if audio_exists and mel_exists:
                     valid_metadata.append(item)
                     fname = os.path.basename(rel_audio_path)
                     idx_str = fname.replace("sample_", "").replace(".wav", "")

@@ -118,14 +118,17 @@ class GuitarDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.metadata[idx]
-        # Nel metodo __getitem__ di mel.py
+        # Leggi il percorso dal dizionario del dataset
         rel_path = self.samples[idx]["mel_file"]
 
-        # Sostituisce le barre rovesciate di Windows con quelle standard di Linux/POSIX
-        rel_path_clean = rel_path.replace("\\", "/")
+        # Pulisce la stringa sostituendo le barre di Windows (\) con quelle di Linux (/) 
+        # e rimuove eventuali duplicati della cartella 'mel' se già presenti nel percorso
+        clean_path = rel_path.replace("\\", "/")
+        if clean_path.startswith("mel/"):
+            clean_path = clean_path[4:]
 
-        # Costruisce il percorso in modo portabile su qualsiasi sistema operativo
-        spec_path = os.path.normpath(os.path.join(self.dataset_dir, rel_path_clean))
+        # Costruisce il percorso puntando correttamente a /content/dataset/mel/nome_file.npy
+        spec_path = os.path.join(self.dataset_dir, "mel", os.path.basename(clean_path))
 
         mel_norm = np.load(spec_path)
         x_tensor = torch.tensor(mel_norm, dtype=torch.float32).unsqueeze(0)

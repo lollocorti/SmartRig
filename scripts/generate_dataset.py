@@ -1,18 +1,17 @@
 import os
 import json
 import random
-import shutil
 import warnings
+import gc
+import multiprocessing as mp
 import numpy as np
 import soundfile as sf
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import librosa
 from pedalboard import VST3Plugin
 
 import audio
 import helix
-from mel import generate_mel_spectrograms
 
-# Soppressione dei warning di normalizzazione nella console
 warnings.filterwarnings("ignore", category=UserWarning, module="pyloudnorm")
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,71 +29,87 @@ CHUNK_DURATION = 3.0
 TARGET_LUFS = -18.0
 NUM_SAMPLES = 5000
 N_MELS = 256
-NUM_WORKERS = max(1, os.cpu_count() - 2)  # Riserva 2 core per il sistema
+BATCH_SIZE = 50  # Processa 50 campioni per ogni istanza del VST3 prima di riciclare il processo
 
 
-def _process_sample_batch(batch_indices: list, cached_files: list, loaded_presets: list, audio_dir: str) -> list:
-    """Funzione eseguita in modo isolato da ciascun processo figlio."""
-    # Prova a caricare il VST3; se fallisce la DLL nativa, interrompe in modo pulito solo questo worker
-    plugin = None
+def render_batch_worker(
+    tasks: list,
+    sample_rate: int,
+    target_lufs: float,
+    audio_dir: str,
+    mel_dir: str,
+    vst_path: str,
+    queue: mp.Queue
+):
+    """
+    Inizializza Helix Native UNA VOLTA sola per un batch di 50 campioni.
+    Invia i dati alla Queue in tempo reale dopo ogni singolo campione elaborato.
+    """
     try:
-        plugin = VST3Plugin(HELIX_VST3_PATH)
-    except Exception as e:
-        print(f"[ERROR Worker] Impossibile caricare VST3 nel worker: {e}")
-        return []
+        plugin = VST3Plugin(vst_path)
 
-    chunk_samples = int(SAMPLE_RATE * CHUNK_DURATION)
-    batch_metadata = []
-
-    for sample_idx in batch_indices:
-        try:
-            audio_clean, selected_cache_file = audio.get_audio_chunk(cached_files, chunk_samples)
-
-            if loaded_presets:
-                selected_preset = random.choice(loaded_presets)
+        for sample_idx, audio_clean, selected_preset, cache_filename in tasks:
+            try:
                 preset_config = helix.parse_and_randomize_preset_blocks(selected_preset["preset_data"])
-                
-                # Applica i parametri al VST3
+
+                audio_stereo_in = np.stack([audio_clean, audio_clean], axis=0)
+                audio_processing = plugin(audio_stereo_in, sample_rate)
+
+                if audio_processing.ndim > 1:
+                    audio_processing = np.mean(audio_processing, axis=0)
+
+                audio_final = np.nan_to_num(audio_processing, nan=0.0, posinf=0.9, neginf=-0.9)
+                audio_final = audio.normalize_lufs_or_rms(audio_final, sample_rate=sample_rate, target_lufs=target_lufs)
+                audio_final = np.ascontiguousarray(audio_final, dtype=np.float32)
+
+                # 1. Salvataggio File Audio WAV
+                wav_filename = f"sample_{sample_idx:05d}.wav"
+                abs_audio_path = os.path.join(audio_dir, wav_filename)
+                sf.write(abs_audio_path, audio_final, sample_rate)
+
+                # 2. Calcolo e salvataggio Spettrogramma Mel (.npy)
+                mel_spec = librosa.feature.melspectrogram(
+                    y=audio_final, sr=sample_rate, n_fft=2048, hop_length=512, n_mels=N_MELS
+                )
+                mel_db = librosa.power_to_db(mel_spec, ref=1.0)
+                mel_norm = np.clip((mel_db + 80.0) / 80.0, 0.0, 1.0).astype(np.float32)
+
+                npy_filename = f"sample_{sample_idx:05d}.npy"
+                abs_mel_path = os.path.join(mel_dir, npy_filename)
+                np.save(abs_mel_path, mel_norm)
+
+                # 3. Metadati per JSON
                 signal_chain_label = {
-                    "source_preset": selected_preset["filename"],
+                    "preset_file": selected_preset["filename"],
+                    "preset_original_name": preset_config.get("preset_name", "Unknown"),
                     "config": preset_config
                 }
-            else:
-                signal_chain_label = {}
 
-            # Processamento audio
-            audio_stereo_in = np.stack([audio_clean, audio_clean], axis=0)
-            
-            # Chiamata protetta al VST3
-            audio_processing = plugin(audio_stereo_in, SAMPLE_RATE)
+                metadata_entry = {
+                    "audio_file": os.path.join("audio", wav_filename),
+                    "mel_file": os.path.join("mel", npy_filename),
+                    "source_file": os.path.basename(cache_filename),
+                    "signal_chain": signal_chain_label
+                }
 
-            if audio_processing.ndim > 1:
-                audio_processing = np.mean(audio_processing, axis=0)
+                # Invio immediato alla coda principale
+                queue.put(("ITEM_SUCCESS", sample_idx, metadata_entry))
 
-            audio_final = np.nan_to_num(audio_processing, nan=0.0, posinf=0.9, neginf=-0.9)
-            audio_final = audio.normalize_lufs_or_rms(audio_final, sample_rate=SAMPLE_RATE, target_lufs=TARGET_LUFS)
+            except Exception as item_err:
+                queue.put(("ITEM_ERROR", sample_idx, str(item_err)))
 
-            filename = f"sample_{sample_idx:05d}.wav"
-            abs_audio_path = os.path.join(audio_dir, filename)
-            sf.write(abs_audio_path, audio_final, SAMPLE_RATE)
+        del plugin
+        gc.collect()
 
-            batch_metadata.append({
-                "audio_file": os.path.join("audio", filename),
-                "source_file": os.path.basename(selected_cache_file),
-                "signal_chain": signal_chain_label
-            })
-        except Exception as e:
-            # Cattura errori su singoli campioni
-            continue
-
-    # Pulisci il riferimento al plugin alla fine del batch
-    del plugin
-    return batch_metadata
+    except Exception as batch_err:
+        queue.put(("BATCH_FATAL", None, str(batch_err)))
 
 
-def generate_audio_dataset_sequential(num_samples: int = NUM_SAMPLES, dataset_dir: str = OUTPUT_DATASET_DIR):
+def generate_dataset_optimized(num_samples: int = NUM_SAMPLES, dataset_dir: str = OUTPUT_DATASET_DIR):
     audio_dir = os.path.join(dataset_dir, "audio")
+    mel_dir = os.path.join(dataset_dir, "mel")
     os.makedirs(audio_dir, exist_ok=True)
+    os.makedirs(mel_dir, exist_ok=True)
     os.makedirs(PRESETS_DIR, exist_ok=True)
 
     if not os.path.exists(HELIX_VST3_PATH):
@@ -103,100 +118,104 @@ def generate_audio_dataset_sequential(num_samples: int = NUM_SAMPLES, dataset_di
     print("[PREPROC] Inizializzazione cache audio 48 kHz...")
     cached_files = audio.prepare_48k_cache(IDMT_DATASET_DIR, CACHE_48K_DIR, SAMPLE_RATE)
 
-    # Caricamento e controllo dei preset ordinati
     loaded_presets = helix.load_helix_presets(PRESETS_DIR)
     if not loaded_presets:
-        raise FileNotFoundError(f"Nessun file .hlx trovato nella cartella: {PRESETS_DIR}")
+        raise FileNotFoundError(f"Nessun file .hlx trovato in {PRESETS_DIR}")
     
-    print(f"[PRESET] Caricati correttamente {len(loaded_presets)} preset (da {loaded_presets[0]['filename']} a {loaded_presets[-1]['filename']})")
+    print(f"[PRESET] Caricati {len(loaded_presets)} preset .hlx validati")
 
-    # Inizializza un'UNICA istanza VST3 persistente nel processo principale
-    print("[VST3] Caricamento istanza Helix Native...")
-    plugin = VST3Plugin(HELIX_VST3_PATH)
-
+    # --- CONTROLLO RIPRESA E VERIFICA FILE ---
+    json_path = os.path.join(dataset_dir, "dataset_labels.json")
     metadata = []
-    chunk_samples = int(SAMPLE_RATE * CHUNK_DURATION)
+    processed_indices = set()
 
-    print(f"[SEQUENTIAL] Avvio generazione di {num_samples} campioni...")
-
-    for sample_idx in range(num_samples):
+    if os.path.exists(json_path):
         try:
-            audio_clean, selected_cache_file = audio.get_audio_chunk(cached_files, chunk_samples)
+            with open(json_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+                
+            valid_metadata = []
+            for item in metadata:
+                rel_audio_path = item.get("audio_file", "")
+                rel_mel_path = item.get("mel_file", "")
+                abs_audio_path = os.path.join(dataset_dir, rel_audio_path)
+                abs_mel_path = os.path.join(dataset_dir, rel_mel_path) if rel_mel_path else ""
+                
+                if os.path.exists(abs_audio_path) and os.path.exists(abs_mel_path):
+                    valid_metadata.append(item)
+                    fname = os.path.basename(rel_audio_path)
+                    idx_str = fname.replace("sample_", "").replace(".wav", "")
+                    if idx_str.isdigit():
+                        processed_indices.add(int(idx_str))
 
-            if loaded_presets:
-                selected_preset = random.choice(loaded_presets)
-                preset_config = helix.parse_and_randomize_preset_blocks(selected_preset["preset_data"])
-
-                signal_chain_label = {
-                    "preset_file": selected_preset["filename"],         # es. "preset12.hlx"
-                    "preset_original_name": preset_config["preset_name"], # es. "Archetype Lead"
-                    "config": preset_config
-                }
-            else:
-                signal_chain_label = {}
-
-            # Processamento audio VST3
-            audio_stereo_in = np.stack([audio_clean, audio_clean], axis=0)
-            audio_processing = plugin(audio_stereo_in, SAMPLE_RATE)
-
-            if audio_processing.ndim > 1:
-                audio_processing = np.mean(audio_processing, axis=0)
-
-            audio_final = np.nan_to_num(audio_processing, nan=0.0, posinf=0.9, neginf=-0.9)
-            audio_final = audio.normalize_lufs_or_rms(audio_final, sample_rate=SAMPLE_RATE, target_lufs=TARGET_LUFS)
-
-            filename = f"sample_{sample_idx:05d}.wav"
-            abs_audio_path = os.path.join(audio_dir, filename)
-            sf.write(abs_audio_path, audio_final, SAMPLE_RATE)
-
-            metadata.append({
-                "audio_file": os.path.join("audio", filename),
-                "source_file": os.path.basename(selected_cache_file),
-                "signal_chain": signal_chain_label
-            })
-
-            if (sample_idx + 1) % 50 == 0 or (sample_idx + 1) == num_samples:
-                print(f"[PROGRESSO] Processati {sample_idx + 1}/{num_samples} campioni completati")
+            metadata = valid_metadata
+            print(f"[RIPRESA] Verificati {len(metadata)} campioni completi nel JSON. Ripresa in corso...")
 
         except Exception as e:
-            print(f"[WARN] Errore nell'elaborazione del campione {sample_idx}: {e}")
-            continue
+            print(f"[WARN] Impossibile leggere JSON ({e}), reset metadati.")
+            metadata = []
+            processed_indices = set()
 
-    json_path = os.path.join(dataset_dir, "dataset_labels.json")
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, indent=4)
+    chunk_samples = int(SAMPLE_RATE * CHUNK_DURATION)
+    missing_indices = [idx for idx in range(num_samples) if idx not in processed_indices]
 
-    print(f"[COMPLETATO] Generati con successo {len(metadata)} campioni audio.")
+    print(f"[GENERAZIONE] Rimanenti {len(missing_indices)} campioni da elaborare...")
 
-def create_colab_zip(dataset_dir: str = OUTPUT_DATASET_DIR):
-    zip_base_name = os.path.join(PROJECT_ROOT, "dataset")
-    temp_dir = os.path.join(PROJECT_ROOT, "temp_dataset")
-    os.makedirs(temp_dir, exist_ok=True)
+    # Processa a blocchi di BATCH_SIZE
+    for i in range(0, len(missing_indices), BATCH_SIZE):
+        batch_indices = missing_indices[i:i + BATCH_SIZE]
+        tasks = []
 
-    try:
-        json_src = os.path.join(dataset_dir, "dataset_labels.json")
-        mel_src = os.path.join(dataset_dir, "mel")
+        for s_idx in batch_indices:
+            audio_clean, selected_cache_file = audio.get_audio_chunk(cached_files, chunk_samples)
+            selected_preset = random.choice(loaded_presets)
+            tasks.append((s_idx, audio_clean, selected_preset, selected_cache_file))
 
-        if os.path.exists(json_src):
-            shutil.copy(json_src, temp_dir)
-        if os.path.exists(mel_src):
-            shutil.copytree(mel_src, os.path.join(temp_dir, "mel"), dirs_exist_ok=True)
+        queue = mp.Queue()
+        worker = mp.Process(
+            target=render_batch_worker,
+            args=(tasks, SAMPLE_RATE, TARGET_LUFS, audio_dir, mel_dir, HELIX_VST3_PATH, queue)
+        )
+        worker.start()
 
-        shutil.make_archive(zip_base_name, "zip", temp_dir)
-        print(f"[EXPORT] Archivio dataset generato: {zip_base_name}.zip")
+        # Legge i dati inviati in tempo reale durante l'esecuzione del batch
+        while worker.is_alive() or not queue.empty():
+            try:
+                status, s_idx, payload = queue.get(timeout=1.0)
 
-    finally:
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
+                if status == "ITEM_SUCCESS":
+                    metadata.append(payload)
+                    processed_indices.add(s_idx)
 
+                    # Scrittura sincrona e immediata su JSON per ogni singolo campione
+                    with open(json_path, "w", encoding="utf-8") as f:
+                        json.dump(metadata, f, indent=4)
+
+                    print(f"[OK] Campione {s_idx:05d} salvato + label aggiornata nel JSON ({len(processed_indices)}/{num_samples})")
+
+                elif status == "ITEM_ERROR":
+                    print(f"[WARN] Errore sul campione {s_idx}: {payload}")
+
+                elif status == "BATCH_FATAL":
+                    print(f"[ERROR] Errore fatale VST nel batch: {payload}")
+
+            except mp.queues.Empty:
+                pass
+
+        worker.join(timeout=5)
+
+        if worker.is_alive():
+            print(f"[TIMEOUT] Il batch a partire da {batch_indices[0]} è bloccato. Terminazione processo...")
+            worker.terminate()
+            worker.join()
+
+    print(f"[COMPLETATO] Generazione terminata. Totale campioni nel dataset: {len(metadata)}")
+    
 
 def main():
-    print("=== GENERAZIONE DATASET PARALLELA ===")
-
-    generate_audio_dataset_sequential(num_samples=NUM_SAMPLES, dataset_dir=OUTPUT_DATASET_DIR)
-    generate_mel_spectrograms(dataset_dir=OUTPUT_DATASET_DIR, sample_rate=SAMPLE_RATE, n_mels=N_MELS)
-    create_colab_zip(dataset_dir=OUTPUT_DATASET_DIR)
-
+    mp.set_start_method("spawn", force=True)
+    print("=== GENERAZIONE DATASET REAL-TIME (SmartRig) ===")
+    generate_dataset_optimized(num_samples=NUM_SAMPLES, dataset_dir=OUTPUT_DATASET_DIR)
     print("=== ESECUZIONE COMPLETATA ===")
 
 

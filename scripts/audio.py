@@ -50,16 +50,21 @@ def prepare_48k_cache(idmt_dir: str, cache_dir: str, target_sr: int) -> list:
     return cached_file_paths
 
 
-def get_audio_chunk(cached_files: list, chunk_samples: int) -> tuple:
+def get_audio_chunk(cached_files: list, chunk_samples: int, max_attempts: int = 50) -> tuple:
     audio_clean = None
     selected_cache_file = None
+    attempts = 0
 
-    while audio_clean is None:
+    while audio_clean is None and attempts < max_attempts:
+        attempts += 1
         selected_cache_file = np.random.choice(cached_files)
         try:
             audio_clean, _ = sf.read(selected_cache_file)
         except Exception:
             pass
+
+    if audio_clean is None:
+        raise RuntimeError("Impossibile caricare un chunk audio valido dalla cache.")
 
     if len(audio_clean) < chunk_samples:
         repeats = int(np.ceil(chunk_samples / len(audio_clean)))

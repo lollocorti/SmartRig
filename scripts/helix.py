@@ -39,7 +39,7 @@ def load_helix_presets(presets_dir: str) -> list:
 
 
 def parse_and_randomize_preset_blocks(preset_obj: dict) -> dict:
-    """Estrae la catena di blocchi da un preset ed esegue la randomizzazione dei parametri."""
+    """Estrae la catena di blocchi ed esegue la randomizzazione proporzionale dei parametri."""
     tone_data = preset_obj.get("data", {}).get("tone", {})
     preset_name = preset_obj.get("data", {}).get("meta", {}).get("name", "Unknown")
 
@@ -60,7 +60,6 @@ def parse_and_randomize_preset_blocks(preset_obj: dict) -> dict:
             model_name = str(block_val.get("@model", "Unknown"))
             is_enabled = bool(block_val.get("@enabled", True))
             
-            # Randomizzazione controllata dello stato ON/OFF (salvaguardando il blocco finale)
             if not block_key.endswith("2"): 
                 is_enabled = bool(np.random.choice([True, False], p=[0.75, 0.25]))
 
@@ -69,15 +68,16 @@ def parse_and_randomize_preset_blocks(preset_obj: dict) -> dict:
                 if k.startswith("@"):
                     continue
                 
-                # Perturbazione dei parametri numerici (+/- 15%)
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
-                    variation = float(np.random.uniform(-0.15, 0.15))
-                    new_val = float(v + variation)
-                    
                     if 0.0 <= v <= 1.0:
-                        new_val = float(np.clip(new_val, 0.0, 1.0))
+                        # Variazione additiva per parametri gia in range [0, 1]
+                        variation = float(np.random.uniform(-0.15, 0.15))
+                        new_val = float(np.clip(v + variation, 0.0, 1.0))
                     else:
-                        new_val = max(0.0, new_val)
+                        # Perturbazione percentuale (+/- 15%) per Hz, ms o valori dB ampi
+                        factor = float(np.random.uniform(0.85, 1.15))
+                        new_val = max(0.0, float(v * factor))
+                        
                     block_params[str(k)] = round(new_val, 4)
                 elif isinstance(v, bool):
                     block_params[str(k)] = bool(np.random.choice([v, not v], p=[0.8, 0.2]))

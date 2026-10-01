@@ -1,21 +1,22 @@
+
 import os
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
+
+# Import aggiornati ai nuovi moduli
 from dataset import GuitarDataset
 from model import FullSignalChainEstimator
 
 def main(dataset_dir="/content/dataset", drive_models_dir="/content/drive/MyDrive/SmartRig/models"):
-    # Configurazione del percorso per salvare il modello su Google Drive
     os.makedirs(drive_models_dir, exist_ok=True)
     model_save_path = os.path.join(drive_models_dir, "best_model.pth")
 
-    # 1. Configurazione del dispositivo
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Dispositivo di addestramento: {device}")
 
-    # 2. Caricamento Dataset e Split
+    # Caricamento Dataset
     full_dataset = GuitarDataset(dataset_dir, is_train=True)
     chain_config = full_dataset.get_chain_config()
     
@@ -23,46 +24,41 @@ def main(dataset_dir="/content/dataset", drive_models_dir="/content/drive/MyDriv
     val_size = int(0.15 * total_size)
     train_size = total_size - val_size
     
-    # Split deterministico per mantenere consistenza tra i run
     generator = torch.Generator().manual_seed(42)
     train_data, val_data = random_split(full_dataset, [train_size, val_size], generator=generator)
-    
-    # Disabilita le augmentation (masking) sul validation set
     val_data.dataset.is_train = False 
 
-    # Suggerimento per Colab: num_workers=2 è spesso più stabile di 4 per evitare colli di bottiglia di I/O
     train_loader = DataLoader(train_data, batch_size=32, shuffle=True, num_workers=2, pin_memory=True)
     val_loader = DataLoader(val_data, batch_size=32, shuffle=False, num_workers=2, pin_memory=True)
 
-    # 3. Inizializzazione Modello
+    # Inizializzazione Modello
     model = FullSignalChainEstimator(chain_config).to(device)
 
-    # 4. Funzioni di Loss e Pesi
+    # Funzioni di Loss e Pesi Aggiustati
     criterion_active = nn.BCEWithLogitsLoss()
     criterion_model = nn.CrossEntropyLoss()
-    criterion_params = nn.MSELoss()
+    criterion_params = nn.HuberLoss()  # Più stabile per regressioni in [0, 1]
 
-    loss_weights = {"active": 2.0, "model": 2.0, "params": 0.1}
+    # Aumentato il peso dei parametri per bilanciare l'output Sigmoid
+    loss_weights = {"active": 1.0, "model": 1.0, "params": 2.0}
 
-    # 5. Ottimizzatore e Scheduler per Transformer
     epochs = 150
     optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-3)
     
+    # max_lr ridotto da 3e-2 a 1e-3 per stabilità del Transformer
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer, 
-        max_lr=3e-2, 
+        max_lr=1e-3, 
         steps_per_epoch=len(train_loader), 
         epochs=epochs
     )
     
     scaler = torch.amp.GradScaler('cuda')
 
-    # 6. Variabili Early Stopping
     best_val_loss = float('inf')
     patience = 25
     patience_counter = 0
 
-    # 7. Ciclo di Addestramento
     for epoch in range(epochs):
         model.train()
         train_loss = 0.0
@@ -110,7 +106,7 @@ def main(dataset_dir="/content/dataset", drive_models_dir="/content/drive/MyDriv
 
         avg_train_loss = train_loss / len(train_loader)
 
-        # 8. Ciclo di Validazione
+        # Validazione
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -147,7 +143,6 @@ def main(dataset_dir="/content/dataset", drive_models_dir="/content/drive/MyDriv
         
         print(f"Epoch {epoch+1:03d}/{epochs} | LR: {current_lr:.2e} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
 
-        # 9. Early Stopping & Checkpointing (Salvataggio su Google Drive)
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             patience_counter = 0
@@ -156,7 +151,7 @@ def main(dataset_dir="/content/dataset", drive_models_dir="/content/drive/MyDriv
         else:
             patience_counter += 1
             if patience_counter >= patience:
-                print(f"\nEarly stopping attivato all'epoca {epoch+1}. La Validation Loss non migliora da {patience} epoche.")
+                print(f"\nEarly stopping attivato all'epoca {epoch+1}.")
                 break
 
 if __name__ == "__main__":

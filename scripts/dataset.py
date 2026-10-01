@@ -5,6 +5,38 @@ import numpy as np
 from torch.utils.data import Dataset
 import torchaudio.transforms as T
 
+
+def normalize_param_value(key: str, val: float) -> float:
+    """Normalizza qualsiasi valore di parametro Helix nell'intervallo preciso [0.0, 1.0]."""
+    clean_val = float(val)
+    k_lower = key.lower()
+
+    # 1. Frequenze (Hz): scala logaritmica da 20Hz a 20000Hz
+    if any(x in k_lower for x in ["freq", "hz", "cut", "hpf", "lpf"]):
+        clean_val = max(20.0, min(20000.0, clean_val))
+        log_val = np.log10(clean_val)
+        norm_val = (log_val - np.log10(20.0)) / (np.log10(20000.0) - np.log10(20.0))
+        return float(np.clip(norm_val, 0.0, 1.0))
+
+    # 2. Tempi e Delay (ms): scala lineare fino a 5000ms
+    if any(x in k_lower for x in ["time", "delay", "ms"]):
+        return float(np.clip(clean_val / 5000.0, 0.0, 1.0))
+
+    # 3. Valori già compresi tra 0 e 1
+    if 0.0 <= clean_val <= 1.0:
+        return float(clean_val)
+
+    # 4. Fallback per guadagni o percentuali estese (> 1.0)
+    if clean_val > 1.0:
+        return float(np.clip(clean_val / 100.0, 0.0, 1.0))
+
+    # 5. Valori negativi (es. dB fino a -80dB)
+    if clean_val < 0.0:
+        return float(np.clip((clean_val + 80.0) / 100.0, 0.0, 1.0))
+
+    return float(np.clip(clean_val, 0.0, 1.0))
+
+
 class GuitarDataset(Dataset):
     def __init__(self, dataset_dir: str, is_train: bool = True):
         self.dataset_dir = dataset_dir
@@ -20,11 +52,9 @@ class GuitarDataset(Dataset):
         self.time_masking = T.TimeMasking(time_mask_param=35)
         self.freq_masking = T.FrequencyMasking(freq_mask_param=30)
 
-        # Costruzione dei vocabolari dei modelli e della configurazione globale
         self.chain_config, self.model2id = self._build_chain_vocab()
 
     def _build_chain_vocab(self):
-        """Analizza il dataset per mappare tutti i blocchi, modelli e max parametri."""
         blocks_info = {}
 
         for item in self.metadata:
@@ -38,7 +68,6 @@ class GuitarDataset(Dataset):
                     model_name = b_data.get("model", "Unknown")
                     blocks_info[b_id]["models"].add(model_name)
 
-                    # Conta solo i parametri numerici (ignorando i booleani)
                     params_dict = b_data.get("parameters", {})
                     num_params = sum(1 for v in params_dict.values() if isinstance(v, (int, float)) and not isinstance(v, bool))
                     
@@ -69,7 +98,6 @@ class GuitarDataset(Dataset):
     def __getitem__(self, idx):
         item = self.metadata[idx]
         
-        # FIX 1: Lettura sicura del percorso cross-platform
         rel_path = item.get("mel_file", "").replace("\\", "/")
         if rel_path.startswith("mel/"):
             rel_path = rel_path[4:]
@@ -100,7 +128,6 @@ class GuitarDataset(Dataset):
                     m_name = b_data.get("model", "Unknown")
                     model_idx = self.model2id[b_id].get(m_name, 0)
 
-                    # FIX 2: Estrazione ordinata e scalata dei parametri
                     params_dict = b_data.get("parameters", {})
                     sorted_keys = sorted(params_dict.keys())
 
@@ -108,21 +135,10 @@ class GuitarDataset(Dataset):
                     for k in sorted_keys:
                         val = params_dict[k]
                         if isinstance(val, (int, float)) and not isinstance(val, bool):
-                            clean_val = float(val)
-                            
-                            # Esempio di normalizzazione mirata in base al tipo di parametro o al suo range
-                            if "freq" in k.lower():
-                                clean_val = clean_val / 20000.0  # Normalizzazione frequenze (es. max 20kHz)
-                            elif "time" in k.lower() or "delay" in k.lower():
-                                clean_val = clean_val / 5000.0   # Normalizzazione tempi in ms
-                            elif clean_val > 1.0:
-                                clean_val = clean_val / 100.0    # Fallback generale per valori percentuali o gain ampi
-                                
-                            # Assicura che il valore rimanga limitato tra 0.0 e 1.0
-                            clean_val = max(0.0, min(1.0, clean_val))
+                            # Applicazione della normalizzazione specifica per tipo
+                            clean_val = normalize_param_value(k, val)
                             num_params.append(clean_val)
                     
-                    # Padding fino a max_params
                     padded_params = num_params[:max_params] + [0.0] * max(0, max_params - len(num_params))
                 else:
                     is_active = 0.0

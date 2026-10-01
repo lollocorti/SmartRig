@@ -7,8 +7,19 @@ from dataset import GuitarDataset
 from model import FullSignalChainEstimator
 
 def main():
+    # 0. Configurazione Google Drive (Colab)
+    from google.colab import drive
+    drive.mount('/content/drive')
+    
+    # Definiamo i percorsi su Google Drive e Colab
+    drive_models_dir = "/content/drive/MyDrive/SmartRig_Models"
+    os.makedirs(drive_models_dir, exist_ok=True)
+    
+    model_save_path = os.path.join(drive_models_dir, "best_model.pth")
+
     # 1. Configurazione Iniziale
-    dataset_dir = "./dataset"  # Aggiorna con il percorso corretto
+    # Se scarichi il dataset direttamente nell'ambiente locale di Colab
+    dataset_dir = "./dataset"  
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Dispositivo di addestramento: {device}")
 
@@ -27,8 +38,9 @@ def main():
     # Disabilita le augmentation (masking) sul validation set
     val_data.dataset.is_train = False 
 
-    train_loader = DataLoader(train_data, batch_size=32, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_data, batch_size=32, shuffle=False, num_workers=4, pin_memory=True)
+    # Suggerimento per Colab: num_workers=2 è spesso più stabile di 4 per evitare colli di bottiglia di I/O
+    train_loader = DataLoader(train_data, batch_size=32, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_data, batch_size=32, shuffle=False, num_workers=2, pin_memory=True)
 
     # 3. Inizializzazione Modello
     model = FullSignalChainEstimator(chain_config).to(device)
@@ -38,15 +50,12 @@ def main():
     criterion_model = nn.CrossEntropyLoss()
     criterion_params = nn.MSELoss()
 
-    # Pesi bilanciati: Riduciamo drasticamente l'impatto della MSELoss iniziale
     loss_weights = {"active": 2.0, "model": 2.0, "params": 0.1}
 
     # 5. Ottimizzatore e Scheduler per Transformer
     epochs = 150
-    # AdamW è superiore ad Adam standard quando si usano i Transformer
     optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
     
-    # OneCycleLR gestisce automaticamente il "warmup" (crescita graduale del LR) per le prime epoche
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer, 
         max_lr=3e-4, 
@@ -54,7 +63,7 @@ def main():
         epochs=epochs
     )
     
-    scaler = torch.amp.GradScaler('cuda') # Mixed Precision per velocizzare e risparmiare VRAM
+    scaler = torch.amp.GradScaler('cuda')
 
     # 6. Variabili Early Stopping
     best_val_loss = float('inf')
@@ -83,7 +92,6 @@ def main():
 
                     loss_active = criterion_active(out["active_logits"], target_active)
                     
-                    # La loss del modello e dei parametri ha senso solo se il blocco è attivo
                     mask_active = target_active > 0.5
                     if mask_active.any():
                         loss_model = criterion_model(out["model_logits"][mask_active], target_model[mask_active])
@@ -98,15 +106,13 @@ def main():
                     
                     batch_loss += block_loss
 
-            # Scaler per Mixed Precision e Gradient Clipping
             scaler.scale(batch_loss).backward()
             scaler.unscale_(optimizer)
-            # Il Gradient Clipping è vitale per prevenire l'esplosione dei gradienti nei Transformer
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step() # Aggiorna il learning rate ad ogni step (batch)
+            scheduler.step()
 
             train_loss += batch_loss.item()
 
@@ -149,12 +155,12 @@ def main():
         
         print(f"Epoch {epoch+1:03d}/{epochs} | LR: {current_lr:.2e} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
 
-        # 9. Early Stopping & Checkpointing
+        # 9. Early Stopping & Checkpointing (Salvataggio su Google Drive)
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
             patience_counter = 0
-            torch.save(model.state_dict(), "best_model.pth")
-            print("  -> Modello migliorato e salvato!")
+            torch.save(model.state_dict(), model_save_path)
+            print(f"  -> Modello migliorato e salvato su Drive: {model_save_path}")
         else:
             patience_counter += 1
             if patience_counter >= patience:

@@ -3,7 +3,6 @@ import torch.nn as nn
 
 
 class ResBlock(nn.Module):
-  """Residual Block 2D con due convoluzioni 3x3 e skip connection."""
 
   def __init__(self, in_channels: int, out_channels: int, stride=1):
     super().__init__()
@@ -16,7 +15,6 @@ class ResBlock(nn.Module):
         bias=False,
     )
     self.bn1 = nn.BatchNorm2d(out_channels)
-    # Rimosso inplace=True per evitare problemi con Autograd
     self.relu = nn.ReLU()
     self.conv2 = nn.Conv2d(
         out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False
@@ -45,7 +43,6 @@ class ResBlock(nn.Module):
 
 
 class PositionalEncoding(nn.Module):
-  """Aggiunge informazioni sulla posizione temporale della sequenza."""
 
   def __init__(self, d_model: int, max_len: int = 1000):
     super().__init__()
@@ -57,7 +54,6 @@ class PositionalEncoding(nn.Module):
 
 
 class CNNTransformerBackbone(nn.Module):
-  """Estrattore di feature Ibrido: CNN + Transformer."""
 
   def __init__(
       self,
@@ -67,7 +63,6 @@ class CNNTransformerBackbone(nn.Module):
   ):
     super().__init__()
 
-    # 1. Frontend Convoluzionale
     c1, c2, c3 = out_channels // 8, out_channels // 4, out_channels // 2
 
     self.stem = nn.Sequential(
@@ -80,11 +75,9 @@ class CNNTransformerBackbone(nn.Module):
     self.layer3 = ResBlock(c3, out_channels, stride=2)
 
     self.freq_pool = nn.AdaptiveAvgPool2d((1, None))
-
-    # Positional Encoding per la sequenza temporale
     self.pos_encoder = PositionalEncoding(d_model=out_channels)
 
-    # 2. Backend Transformer
+    # Pre-LayerNormalization attivata (norm_first=True)
     encoder_layer = nn.TransformerEncoderLayer(
         d_model=out_channels,
         nhead=nhead,
@@ -92,33 +85,28 @@ class CNNTransformerBackbone(nn.Module):
         dropout=0.1,
         activation="gelu",
         batch_first=True,
+        norm_first=True,  # Stabilizza l'addestramento da zero
     )
     self.transformer = nn.TransformerEncoder(
         encoder_layer, num_layers=num_transformer_layers
     )
+    self.out_norm = nn.LayerNorm(out_channels)
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     x = self.stem(x)
     x = self.layer1(x)
     x = self.layer2(x)
-    x = self.layer3(x)  # [Batch, Channels, Freq, Time]
+    x = self.layer3(x)
 
-    x = self.freq_pool(x)  # [Batch, Channels, 1, Time]
-    x = x.squeeze(2)  # [Batch, Channels, Time]
-
-    x = x.permute(0, 2, 1)  # [Batch, Time, Channels]
-
-    # Inserimento delle informazioni di posizione temporale
+    x = self.freq_pool(x).squeeze(2).permute(0, 2, 1)
     x = self.pos_encoder(x)
-
     x = self.transformer(x)
 
-    out = x.mean(dim=1)  # Global Average Pooling temporale -> [Batch, Channels]
+    out = self.out_norm(x.mean(dim=1))
     return out
 
 
 class DSPBlockHead(nn.Module):
-  """Head di stima multi-task per un singolo blocco DSP."""
 
   def __init__(self, in_features: int, num_models: int, max_params: int):
     super().__init__()
@@ -127,22 +115,17 @@ class DSPBlockHead(nn.Module):
         nn.Linear(in_features, 256),
         nn.LayerNorm(256),
         nn.ReLU(),
-        nn.Dropout(p=0.3),
+        nn.Dropout(p=0.2),
     )
 
-    # 1. Stato del blocco (Attivo / Bypass) -> Restituisce Logits (usare BCEWithLogitsLoss)
     self.head_active = nn.Linear(256, 1)
-
-    # 2. Modello DSP selezionato -> Restituisce Logits (usare CrossEntropyLoss)
     self.head_model = nn.Linear(256, num_models)
-
-    # 3. Parametri fisici del blocco -> Restituisce valori in [0, 1] (usare MSELoss o HuberLoss)
     self.head_params = nn.Sequential(
         nn.Linear(256, 128),
         nn.LayerNorm(128),
         nn.ReLU(),
         nn.Linear(128, max_params),
-        nn.Sigmoid(),  # <--- SOSTITUITO ReLU CON SIGMOID
+        nn.Sigmoid(),
     )
 
   def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -155,15 +138,12 @@ class DSPBlockHead(nn.Module):
 
 
 class FullSignalChainEstimator(nn.Module):
-  """Architettura unificata per la stima dell'intera catena di segnale."""
 
   def __init__(
       self, block_configs: list[dict[str, any]], feature_dim: int = 512
   ):
     super().__init__()
     self.backbone = CNNTransformerBackbone(out_channels=feature_dim)
-
-    head_in_features = feature_dim
 
     self.block_heads = nn.ModuleDict()
     self.block_ids = []
@@ -172,16 +152,11 @@ class FullSignalChainEstimator(nn.Module):
       b_id = cfg["block_id"]
       self.block_ids.append(b_id)
       self.block_heads[b_id] = DSPBlockHead(
-          in_features=head_in_features,
+          in_features=feature_dim,
           num_models=cfg["num_models"],
           max_params=cfg["max_params"],
       )
 
   def forward(self, x: torch.Tensor) -> dict[str, dict[str, torch.Tensor]]:
-    feat = self.backbone(x)  # [B, feature_dim]
-
-    outputs = {}
-    for b_id in self.block_ids:
-      outputs[b_id] = self.block_heads[b_id](feat)
-
-    return outputs
+    feat = self.backbone(x)
+    return {b_id: self.block_heads[b_id](feat) for b_id in self.block_ids}

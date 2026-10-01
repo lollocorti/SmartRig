@@ -103,16 +103,23 @@ class GuitarDataset(Dataset):
                     # FIX 2: Estrazione ordinata e scalata dei parametri
                     params_dict = b_data.get("parameters", {})
                     sorted_keys = sorted(params_dict.keys())
-                    
+
                     num_params = []
                     for k in sorted_keys:
                         val = params_dict[k]
                         if isinstance(val, (int, float)) and not isinstance(val, bool):
-                            # Se il valore eccede 1.0, applichiamo una normalizzazione naive dividendo per un valore alto
-                            # (Questo aiuta la stabilità della rete neurale in attesa di una normalizzazione formale)
                             clean_val = float(val)
-                            if clean_val > 1.0:
-                                clean_val = clean_val / 1000.0  
+                            
+                            # Esempio di normalizzazione mirata in base al tipo di parametro o al suo range
+                            if "freq" in k.lower():
+                                clean_val = clean_val / 20000.0  # Normalizzazione frequenze (es. max 20kHz)
+                            elif "time" in k.lower() or "delay" in k.lower():
+                                clean_val = clean_val / 5000.0   # Normalizzazione tempi in ms
+                            elif clean_val > 1.0:
+                                clean_val = clean_val / 100.0    # Fallback generale per valori percentuali o gain ampi
+                                
+                            # Assicura che il valore rimanga limitato tra 0.0 e 1.0
+                            clean_val = max(0.0, min(1.0, clean_val))
                             num_params.append(clean_val)
                     
                     # Padding fino a max_params

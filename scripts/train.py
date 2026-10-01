@@ -70,41 +70,58 @@ def main(dataset_dir="/content/dataset", drive_models_dir="/content/drive/MyDriv
             with torch.amp.autocast('cuda'):
                 outputs = model(x)
                 batch_loss = 0.0
+                num_blocks = len(outputs)  # Numero di blocchi DSP nella catena
 
-                for b_id, b_targets in targets.items():
-                    out = outputs[b_id]
-                    
-                    target_active = b_targets["active"].to(device)
-                    target_model = b_targets["model"].to(device)
-                    target_params = b_targets["params"].to(device)
+            for b_id, b_targets in targets.items():
+                out = outputs[b_id]
 
-                    loss_active = criterion_active(out["active_logits"], target_active)
-                    
-                    mask_active = target_active > 0.5
-                    if mask_active.any():
-                        loss_model = criterion_model(out["model_logits"][mask_active], target_model[mask_active])
-                        loss_params = criterion_params(out["params"][mask_active], target_params[mask_active])
-                    else:
-                        loss_model = torch.tensor(0.0, device=device)
-                        loss_params = torch.tensor(0.0, device=device)
+                target_active = b_targets['active'].to(device)
+                target_model = b_targets['model'].to(device)
+                target_params = b_targets['params'].to(device)
 
-                    block_loss = (loss_weights["active"] * loss_active) + \
-                                 (loss_weights["model"] * loss_model) + \
-                                 (loss_weights["params"] * loss_params)
-                    
-                    batch_loss += block_loss
+                loss_active = criterion_active(out['active_logits'], target_active)
 
+                mask_active = target_active > 0.5
+                if mask_active.any():
+                    loss_model = criterion_model(
+                    out['model_logits'][mask_active], target_model[mask_active]
+                )
+                    loss_params = criterion_params(
+                    out['params'][mask_active], target_params[mask_active]
+                )
+                else:
+                    loss_model = torch.tensor(0.0, device=device)
+                    loss_params = torch.tensor(0.0, device=device)
+
+                block_loss = (
+                    (loss_weights['active'] * loss_active)
+                    + (loss_weights['model'] * loss_model)
+                    + (loss_weights['params'] * loss_params)
+                )
+
+                batch_loss += block_loss
+
+            # Normalizza la loss totale sul numero di blocchi per stabilizzare i gradienti
+            batch_loss = batch_loss / num_blocks
+
+            # Backpropagation con Amp GradScaler
             scaler.scale(batch_loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
+
+            # FIX WARNNG SCHEDULER: Esegui lo step dello scheduler solo se l'optimizer NON è stato saltato
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            scale_after = scaler.get_scale()
+
+            if scale_before <= scale_after:
+                scheduler.step()
 
             train_loss += batch_loss.item()
 
         avg_train_loss = train_loss / len(train_loader)
+
 
         # Validazione
         model.eval()

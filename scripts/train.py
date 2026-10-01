@@ -19,7 +19,7 @@ def main():
 
     # 1. Configurazione Iniziale
     # Se scarichi il dataset direttamente nell'ambiente locale di Colab
-    dataset_dir = "./dataset"  
+    dataset_dir = "/content/dataset"  
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Dispositivo di addestramento: {device}")
 

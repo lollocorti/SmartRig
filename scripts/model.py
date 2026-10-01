@@ -91,7 +91,7 @@ class DSPBlockHead(nn.Module):
             nn.Linear(in_features, 256),
             nn.LayerNorm(256),
             nn.ReLU(inplace=True),
-            nn.Dropout(p=0.25)
+            nn.Dropout(p=0.3)
         )
         
         # 1. Stato del blocco (Attivo / Bypass)
@@ -106,9 +106,6 @@ class DSPBlockHead(nn.Module):
             nn.LayerNorm(128),
             nn.ReLU(inplace=True),
             nn.Linear(128, max_params),
-            # FIX CRITICO: Sostituita Sigmoid con ReLU. 
-            # I parametri possono essere > 1.0 (se non perfettamente scalati in preprocessing),
-            # ma non scenderanno sotto 0.0 (fisicamente scorretto per delay/gain ecc.).
             nn.ReLU() 
         )
 

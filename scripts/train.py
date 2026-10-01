@@ -46,11 +46,11 @@ def main(dataset_dir="/content/dataset", drive_models_dir="/content/drive/MyDriv
 
     # 5. Ottimizzatore e Scheduler per Transformer
     epochs = 150
-    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-3)
     
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer, 
-        max_lr=3e-4, 
+        max_lr=3e-2, 
         steps_per_epoch=len(train_loader), 
         epochs=epochs
     )

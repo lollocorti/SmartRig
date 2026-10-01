@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader, random_split
 from dataset import GuitarDataset
 from model import FullSignalChainEstimator
 
-def main(dataset_dir = [], drive_models_dir = []):
+def main(dataset_dir="/content/dataset", drive_models_dir="/content/drive/MyDrive/SmartRig/models"):
     # Configurazione del percorso per salvare il modello su Google Drive
     os.makedirs(drive_models_dir, exist_ok=True)
     model_save_path = os.path.join(drive_models_dir, "best_model.pth")

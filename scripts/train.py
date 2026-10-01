@@ -6,20 +6,12 @@ from torch.utils.data import DataLoader, random_split
 from dataset import GuitarDataset
 from model import FullSignalChainEstimator
 
-def main():
-    # 0. Configurazione Google Drive (Colab)
-    from google.colab import drive
-    drive.mount('/content/drive')
-    
-    # Definiamo i percorsi su Google Drive e Colab
-    drive_models_dir = "/content/drive/MyDrive/SmartRig_Models"
+def main(dataset_dir=None, drive_models_dir = ModuleNotFoundError):
+    # Configurazione del percorso per salvare il modello su Google Drive
     os.makedirs(drive_models_dir, exist_ok=True)
-    
     model_save_path = os.path.join(drive_models_dir, "best_model.pth")
 
-    # 1. Configurazione Iniziale
-    # Se scarichi il dataset direttamente nell'ambiente locale di Colab
-    dataset_dir = "/content/dataset"  
+    # 1. Configurazione del dispositivo
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Dispositivo di addestramento: {device}")
 
